@@ -1,0 +1,5 @@
+Anotações sobre Git
+
+- Commit
+- Branch
+- Snapshot
