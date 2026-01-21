@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
 
 int main () {
 
@@ -40,6 +39,7 @@ int main () {
     } else {
         printf("Sua media e de: %.1f\n", media);
         printf("%s, Voce foi Reprovado! \n", nome);
+        printf("Precisa estudar mais!!..");
     }
     
 
