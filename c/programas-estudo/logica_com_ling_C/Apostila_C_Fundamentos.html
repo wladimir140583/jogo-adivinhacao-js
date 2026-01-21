@@ -1,0 +1,1197 @@
+<html lang="pt-BR"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apostila C - Fundamentos</title>
+    <style>
+        @media print {
+            body { margin: 0; padding: 15mm; }
+            .page-break { page-break-before: always; }
+            .botao-imprimir, .botao-baixar { display: none; }
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Times New Roman', Times, serif;
+            line-height: 1.6;
+            color: #000;
+            background: #fff;
+            max-width: 210mm;
+            margin: 0 auto;
+            padding: 20mm;
+        }
+        
+        h1 {
+            text-align: center;
+            font-size: 24pt;
+            margin-bottom: 5mm;
+            border-bottom: 3px solid #000;
+            padding-bottom: 5mm;
+        }
+        
+        h2 {
+            font-size: 18pt;
+            margin-top: 10mm;
+            margin-bottom: 5mm;
+            border-bottom: 2px solid #333;
+            padding-bottom: 2mm;
+        }
+        
+        h3 {
+            font-size: 14pt;
+            margin-top: 8mm;
+            margin-bottom: 3mm;
+        }
+        
+        h4 {
+            font-size: 12pt;
+            margin-top: 5mm;
+            margin-bottom: 2mm;
+            font-style: italic;
+        }
+        
+        p {
+            text-align: justify;
+            margin-bottom: 3mm;
+            font-size: 11pt;
+        }
+        
+        code {
+            background: #f4f4f4;
+            padding: 2px 5px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 10pt;
+        }
+        
+        pre {
+            background: #f8f8f8;
+            border: 1px solid #ccc;
+            padding: 8mm;
+            margin: 5mm 0;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 9pt;
+            line-height: 1.4;
+        }
+        
+        ul, ol {
+            margin-left: 10mm;
+            margin-bottom: 5mm;
+        }
+        
+        li {
+            margin-bottom: 2mm;
+            font-size: 11pt;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 5mm 0;
+            font-size: 10pt;
+        }
+        
+        th, td {
+            border: 1px solid #000;
+            padding: 3mm;
+            text-align: left;
+        }
+        
+        th {
+            background: #e0e0e0;
+            font-weight: bold;
+        }
+        
+        .exemplo {
+            background: #f9f9f9;
+            border-left: 4px solid #333;
+            padding: 5mm;
+            margin: 5mm 0;
+        }
+        
+        .importante {
+            background: #fff9e6;
+            border: 2px solid #ffcc00;
+            padding: 5mm;
+            margin: 5mm 0;
+        }
+        
+        .rodape {
+            text-align: center;
+            font-size: 9pt;
+            margin-top: 15mm;
+            padding-top: 5mm;
+            border-top: 1px solid #ccc;
+            color: #666;
+        }
+        
+        .botao-imprimir, .botao-baixar {
+            position: fixed;
+            right: 20px;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 5px;
+            cursor: pointer;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            z-index: 1000;
+        }
+        
+        .botao-imprimir {
+            top: 20px;
+            background: #4CAF50;
+        }
+        
+        .botao-imprimir:hover {
+            background: #45a049;
+        }
+        
+        .botao-baixar {
+            top: 80px;
+            background: #2196F3;
+        }
+        
+        .botao-baixar:hover {
+            background: #0b7dda;
+        }
+    </style>
+    <script>
+        function imprimirApostila() {
+            window.print();
+        }
+        
+        function baixarApostila() {
+            const conteudo = document.documentElement.outerHTML;
+            const blob = new Blob([conteudo], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Apostila_C_Fundamentos.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</head>
+<body id="artifacts-component-root-html">
+
+<button class="botao-imprimir" onclick="imprimirApostila()">IMPRIMIR APOSTILA</button>
+<button class="botao-baixar" onclick="baixarApostila()">BAIXAR ARQUIVO HTML</button>
+
+<h1>Apostila de Linguagem C</h1>
+<h1>Fundamentos</h1>
+
+<div style="text-align: center; margin: 10mm 0;">
+    <p style="font-size: 12pt;"><strong>Tópico:</strong> Condicionais e Entrada/Saída</p>
+    <p style="font-size: 11pt;">Material de Referência para Estudo</p>
+</div>
+
+<h2>1. Estrutura Básica de um Programa em C</h2>
+
+<h3>1.1 Programa Mínimo</h3>
+
+<pre>#include &lt;stdio.h&gt;
+
+int main() {
+    return 0;
+}</pre>
+
+<h3>1.2 Componentes Essenciais</h3>
+
+<table>
+    <tbody><tr>
+        <th>Componente</th>
+        <th>Descrição</th>
+    </tr>
+    <tr>
+        <td>#include &lt;stdio.h&gt;</td>
+        <td>Biblioteca padrão de entrada/saída</td>
+    </tr>
+    <tr>
+        <td>int main()</td>
+        <td>Função principal (ponto de entrada)</td>
+    </tr>
+    <tr>
+        <td>return 0;</td>
+        <td>Retorna 0 ao SO (execução bem-sucedida)</td>
+    </tr>
+    <tr>
+        <td>{ }</td>
+        <td>Delimitadores de bloco de código</td>
+    </tr>
+    <tr>
+        <td>;</td>
+        <td>Fim de comando (obrigatório)</td>
+    </tr>
+</tbody></table>
+
+<div class="importante">
+<strong>IMPORTANTE:</strong> Todo comando em C deve terminar com ponto e vírgula (;). A função main() sempre retorna um inteiro (int).
+</div>
+
+<h2>2. Tipos de Dados</h2>
+
+<h3>2.1 Tipos Básicos</h3>
+
+<table>
+    <tbody><tr>
+        <th>Tipo</th>
+        <th>Bytes</th>
+        <th>Faixa</th>
+        <th>Uso</th>
+    </tr>
+    <tr>
+        <td>char</td>
+        <td>1</td>
+        <td>-128 a 127</td>
+        <td>Caracteres</td>
+    </tr>
+    <tr>
+        <td>int</td>
+        <td>4</td>
+        <td>-2,147,483,648 a 2,147,483,647</td>
+        <td>Inteiros</td>
+    </tr>
+    <tr>
+        <td>float</td>
+        <td>4</td>
+        <td>±3.4 × 10^38 (6-7 dígitos)</td>
+        <td>Decimais</td>
+    </tr>
+    <tr>
+        <td>double</td>
+        <td>8</td>
+        <td>±1.7 × 10^308 (15-16 dígitos)</td>
+        <td>Decimais precisos</td>
+    </tr>
+</tbody></table>
+
+<h3>2.2 Declaração de Variáveis</h3>
+
+<pre>// Declaração simples
+int idade;
+float altura;
+char letra;
+
+// Declaração com inicialização
+int idade = 25;
+float altura = 1.75;
+char letra = 'A';
+
+// Múltiplas variáveis do mesmo tipo
+int a, b, c;
+float nota1, nota2, media;</pre>
+
+<div class="importante">
+<strong>ATENÇÃO:</strong> Em C, variáveis não inicializadas contêm "lixo de memória" (valores aleatórios). Sempre inicialize ou atribua um valor antes de usar.
+</div>
+
+<h2>3. Entrada e Saída</h2>
+
+<h3>3.1 printf - Saída de Dados</h3>
+
+<p>Exibe informações na tela (console).</p>
+
+<pre>printf("Texto");
+printf("Numero: %d", variavel);
+printf("Nome: %s, Idade: %d", nome, idade);</pre>
+
+<h3>3.2 Especificadores de Formato</h3>
+
+<table>
+    <tbody><tr>
+        <th>Especificador</th>
+        <th>Tipo</th>
+        <th>Exemplo</th>
+    </tr>
+    <tr>
+        <td>%d ou %i</td>
+        <td>int</td>
+        <td>printf("%d", 10);</td>
+    </tr>
+    <tr>
+        <td>%f</td>
+        <td>float / double</td>
+        <td>printf("%f", 3.14);</td>
+    </tr>
+    <tr>
+        <td>%.1f</td>
+        <td>float com 1 decimal</td>
+        <td>printf("%.1f", 3.14);</td>
+    </tr>
+    <tr>
+        <td>%c</td>
+        <td>char</td>
+        <td>printf("%c", 'A');</td>
+    </tr>
+    <tr>
+        <td>%s</td>
+        <td>string</td>
+        <td>printf("%s", "texto");</td>
+    </tr>
+    <tr>
+        <td>%p</td>
+        <td>ponteiro</td>
+        <td>printf("%p", &amp;var);</td>
+    </tr>
+</tbody></table>
+
+<div class="exemplo">
+<strong>Exemplos de printf:</strong>
+<pre>int idade = 25;
+float nota = 8.75;
+char letra = 'A';
+
+printf("Idade: %d\n", idade);           // Idade: 25
+printf("Nota: %.2f\n", nota);           // Nota: 8.75
+printf("Letra: %c\n", letra);           // Letra: A
+printf("Idade: %d, Nota: %.1f\n", idade, nota);</pre>
+</div>
+
+<h3>3.3 Caracteres Especiais</h3>
+
+<table>
+    <tbody><tr>
+        <th>Código</th>
+        <th>Significado</th>
+    </tr>
+    <tr>
+        <td>\n</td>
+        <td>Nova linha</td>
+    </tr>
+    <tr>
+        <td>\t</td>
+        <td>Tabulação</td>
+    </tr>
+    <tr>
+        <td>\\</td>
+        <td>Barra invertida</td>
+    </tr>
+    <tr>
+        <td>\"</td>
+        <td>Aspas duplas</td>
+    </tr>
+    <tr>
+        <td>\'</td>
+        <td>Aspas simples</td>
+    </tr>
+</tbody></table>
+
+<h3>3.4 scanf - Entrada de Dados</h3>
+
+<p>Lê dados digitados pelo usuário.</p>
+
+<pre>int numero;
+scanf("%d", &amp;numero);  // &amp; = endereço da variável</pre>
+
+<div class="importante">
+<strong>CRÍTICO:</strong> Sempre use o operador &amp; antes da variável no scanf (exceto para strings). Ele indica o endereço de memória onde o valor será armazenado.
+</div>
+
+<div class="exemplo">
+<strong>Exemplos de scanf:</strong>
+<pre>int idade;
+float altura;
+char letra;
+
+printf("Digite sua idade: ");
+scanf("%d", &amp;idade);
+
+printf("Digite sua altura: ");
+scanf("%f", &amp;altura);
+
+printf("Digite uma letra: ");
+scanf(" %c", &amp;letra);  // Espaço antes do %c</pre>
+</div>
+
+<h3>3.5 Lendo Strings</h3>
+
+<h4>Método 1: scanf (sem espaços)</h4>
+<pre>char nome[50];
+scanf("%s", nome);  // Lê até o espaço (sem &amp;)</pre>
+
+<h4>Método 2: scanf com formatação (com espaços)</h4>
+<pre>char nome[50];
+scanf(" %[^\n]", nome);  // Lê até o Enter</pre>
+
+<h4>Método 3: fgets (mais seguro)</h4>
+<pre>char nome[50];
+fgets(nome, 50, stdin);
+nome[strcspn(nome, "\n")] = '\0';  // Remove \n</pre>
+
+<div class="importante">
+<strong>DIFERENÇA:</strong>
+<ul>
+    <li>scanf("%s") para uma palavra</li>
+    <li>scanf(" %[^\n]") ou fgets() para texto com espaços</li>
+    <li>fgets captura o Enter, precisa remover com strcspn</li>
+</ul>
+</div>
+
+<h2>4. Operadores</h2>
+
+<h3>4.1 Operadores Aritméticos</h3>
+
+<table>
+    <tbody><tr>
+        <th>Operador</th>
+        <th>Operação</th>
+        <th>Exemplo</th>
+    </tr>
+    <tr>
+        <td>+</td>
+        <td>Adição</td>
+        <td>a + b</td>
+    </tr>
+    <tr>
+        <td>-</td>
+        <td>Subtração</td>
+        <td>a - b</td>
+    </tr>
+    <tr>
+        <td>*</td>
+        <td>Multiplicação</td>
+        <td>a * b</td>
+    </tr>
+    <tr>
+        <td>/</td>
+        <td>Divisão</td>
+        <td>a / b</td>
+    </tr>
+    <tr>
+        <td>%</td>
+        <td>Módulo (resto)</td>
+        <td>a % b</td>
+    </tr>
+</tbody></table>
+
+<div class="exemplo">
+<strong>Exemplos:</strong>
+<pre>int a = 10, b = 3;
+int soma = a + b;        // 13
+int sub = a - b;         // 7
+int mult = a * b;        // 30
+int div = a / b;         // 3 (divisão inteira!)
+int resto = a % b;       // 1
+
+float x = 10.0, y = 3.0;
+float divisao = x / y;   // 3.333...</pre>
+</div>
+
+<div class="importante">
+<strong>ATENÇÃO - Divisão Inteira:</strong> Quando ambos operandos são int, o resultado é int. 10 / 3 = 3 (não 3.33). Use float para resultado decimal.
+</div>
+
+<h3>4.2 Operadores de Comparação</h3>
+
+<table>
+    <tbody><tr>
+        <th>Operador</th>
+        <th>Significado</th>
+        <th>Exemplo</th>
+    </tr>
+    <tr>
+        <td>==</td>
+        <td>Igual a</td>
+        <td>a == b</td>
+    </tr>
+    <tr>
+        <td>!=</td>
+        <td>Diferente de</td>
+        <td>a != b</td>
+    </tr>
+    <tr>
+        <td>&gt;</td>
+        <td>Maior que</td>
+        <td>a &gt; b</td>
+    </tr>
+    <tr>
+        <td>&lt;</td>
+        <td>Menor que</td>
+        <td>a &lt; b</td>
+    </tr>
+    <tr>
+        <td>&gt;=</td>
+        <td>Maior ou igual</td>
+        <td>a &gt;= b</td>
+    </tr>
+    <tr>
+        <td>&lt;=</td>
+        <td>Menor ou igual</td>
+        <td>a &lt;= b</td>
+    </tr>
+</tbody></table>
+
+<h3>4.3 Operadores Lógicos</h3>
+
+<table>
+    <tbody><tr>
+        <th>Operador</th>
+        <th>Significado</th>
+        <th>Exemplo</th>
+    </tr>
+    <tr>
+        <td>&amp;&amp;</td>
+        <td>E lógico (AND)</td>
+        <td>(a &gt; 5) &amp;&amp; (b &lt; 10)</td>
+    </tr>
+    <tr>
+        <td>||</td>
+        <td>OU lógico (OR)</td>
+        <td>(a == 0) || (b == 0)</td>
+    </tr>
+    <tr>
+        <td>!</td>
+        <td>NÃO lógico (NOT)</td>
+        <td>!(a == b)</td>
+    </tr>
+</tbody></table>
+
+<h2>5. Estruturas Condicionais</h2>
+
+<h3>5.1 if (SE)</h3>
+
+<pre>if (condicao) {
+    // código executado se verdadeiro
+}</pre>
+
+<div class="exemplo">
+<strong>Exemplo:</strong>
+<pre>int idade = 20;
+
+if (idade &gt;= 18) {
+    printf("Maior de idade\n");
+}</pre>
+</div>
+
+<h3>5.2 if...else (SE...SENÃO)</h3>
+
+<pre>if (condicao) {
+    // código se verdadeiro
+} else {
+    // código se falso
+}</pre>
+
+<div class="exemplo">
+<strong>Exemplo:</strong>
+<pre>int nota = 6;
+
+if (nota &gt;= 7) {
+    printf("Aprovado\n");
+} else {
+    printf("Reprovado\n");
+}</pre>
+</div>
+
+<h3>5.3 if...else if...else</h3>
+
+<pre>if (condicao1) {
+    // código se condicao1 verdadeira
+} else if (condicao2) {
+    // código se condicao2 verdadeira
+} else {
+    // código se todas falsas
+}</pre>
+
+<div class="exemplo">
+<strong>Exemplo - Sistema de Notas:</strong>
+<pre>float media = 8.5;
+
+if (media &gt;= 7.0) {
+    printf("Aprovado\n");
+} else if (media &gt;= 4.0) {
+    printf("Recuperação\n");
+} else {
+    printf("Reprovado\n");
+}</pre>
+</div>
+
+<h3>5.4 Operador Ternário</h3>
+
+<p>Forma compacta de if-else simples:</p>
+
+<pre>variavel = (condicao) ? valor_se_verdadeiro : valor_se_falso;</pre>
+
+<div class="exemplo">
+<strong>Exemplo:</strong>
+<pre>int idade = 20;
+char *status = (idade &gt;= 18) ? "Maior" : "Menor";
+printf("%s de idade\n", status);</pre>
+</div>
+
+<h3>5.5 switch...case</h3>
+
+<p>Para múltiplas opções baseadas em um valor:</p>
+
+<pre>switch (variavel) {
+    case valor1:
+        // código
+        break;
+    case valor2:
+        // código
+        break;
+    default:
+        // código padrão
+}</pre>
+
+<div class="exemplo">
+<strong>Exemplo:</strong>
+<pre>int opcao = 2;
+
+switch (opcao) {
+    case 1:
+        printf("Opção 1\n");
+        break;
+    case 2:
+        printf("Opção 2\n");
+        break;
+    case 3:
+        printf("Opção 3\n");
+        break;
+    default:
+        printf("Opção inválida\n");
+}</pre>
+</div>
+
+<div class="importante">
+<strong>IMPORTANTE:</strong> Não esqueça o <code>break</code> em cada case! Sem ele, a execução continua para o próximo case.
+</div>
+
+<h2>6. Arrays (Vetores)</h2>
+
+<h3>6.1 Declaração</h3>
+
+<pre>tipo nome[tamanho];
+
+int numeros[5];           // Array de 5 inteiros
+float notas[10];          // Array de 10 floats
+char nome[50];            // String de até 49 caracteres</pre>
+
+<h3>6.2 Inicialização</h3>
+
+<pre>int numeros[5] = {10, 20, 30, 40, 50};
+char nome[20] = "João";
+float notas[] = {8.5, 9.0, 7.5};  // Tamanho automático</pre>
+
+<h3>6.3 Acesso aos Elementos</h3>
+
+<pre>int numeros[3] = {10, 20, 30};
+
+printf("%d\n", numeros[0]);  // 10 (primeiro elemento)
+printf("%d\n", numeros[1]);  // 20
+printf("%d\n", numeros[2]);  // 30
+
+numeros[1] = 25;  // Modifica segundo elemento</pre>
+
+<div class="importante">
+<strong>ATENÇÃO:</strong> Índices começam em 0. Um array de tamanho 5 tem índices de 0 a 4.
+</div>
+
+<h2>7. Strings</h2>
+
+<h3>7.1 Declaração e Uso</h3>
+
+<p>Strings em C são arrays de caracteres terminados com '\0'.</p>
+
+<pre>char nome[50];              // Declara string
+char saudacao[] = "Olá";   // Inicializa com texto
+char letra = nome[0];       // Acessa primeiro caractere</pre>
+
+<h3>7.2 Funções de String (string.h)</h3>
+
+<table>
+    <tbody><tr>
+        <th>Função</th>
+        <th>Descrição</th>
+        <th>Exemplo</th>
+    </tr>
+    <tr>
+        <td>strlen()</td>
+        <td>Tamanho da string</td>
+        <td>strlen("Olá") = 3</td>
+    </tr>
+    <tr>
+        <td>strcpy()</td>
+        <td>Copia string</td>
+        <td>strcpy(dest, origem)</td>
+    </tr>
+    <tr>
+        <td>strcat()</td>
+        <td>Concatena strings</td>
+        <td>strcat(str1, str2)</td>
+    </tr>
+    <tr>
+        <td>strcmp()</td>
+        <td>Compara strings</td>
+        <td>strcmp(str1, str2)</td>
+    </tr>
+    <tr>
+        <td>strcspn()</td>
+        <td>Encontra caractere</td>
+        <td>strcspn(str, "\n")</td>
+    </tr>
+</tbody></table>
+
+<div class="exemplo">
+<strong>Exemplo de uso:</strong>
+<pre>#include &lt;string.h&gt;
+
+char nome1[50] = "João";
+char nome2[50];
+
+strcpy(nome2, nome1);         // Copia "João" para nome2
+int tam = strlen(nome1);      // tam = 4
+strcat(nome1, " Silva");      // nome1 = "João Silva"</pre>
+</div>
+
+<h2>8. Exemplo Completo</h2>
+
+<h3>8.1 Programa: Situação do Aluno</h3>
+
+<pre>#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+int main() {
+    float nota1, nota2, media;
+    char nome[50];
+    
+    printf("\n## Programa Situacao do Aluno ##\n\n");
+    
+    // Entrada de dados
+    printf("Digite seu nome: ");
+    fgets(nome, 50, stdin);
+    nome[strcspn(nome, "\n")] = '\0';  // Remove \n
+    
+    printf("Digite a primeira nota: ");
+    scanf("%f", ¬a1);
+    
+    printf("Digite a segunda nota: ");
+    scanf("%f", ¬a2);
+    
+    // Processamento
+    media = (nota1 + nota2) / 2;
+    
+    // Saída com condições
+    printf("\nSua media e de: %.1f\n", media);
+    
+    if (media &gt;= 7.0) {
+        printf("Parabens %s, voce foi Aprovado!\n", nome);
+    } else if (media &gt;= 4.0) {
+        printf("%s, voce esta de Recuperacao.\n", nome);
+    } else {
+        printf("%s, voce foi Reprovado.\n", nome);
+    }
+    
+    return 0;
+}</pre>
+
+<h2>9. Erros Comuns</h2>
+
+<h3>9.1 Esquecer o ponto e vírgula</h3>
+
+<div class="exemplo">
+<strong>Errado:</strong>
+<pre>int x = 10
+printf("Valor: %d", x)</pre>
+
+<strong>Correto:</strong>
+<pre>int x = 10;
+printf("Valor: %d", x);</pre>
+</div>
+
+<h3>9.2 Esquecer o &amp; no scanf</h3>
+
+<div class="exemplo">
+<strong>Errado:</strong>
+<pre>int idade;
+scanf("%d", idade);</pre>
+
+<strong>Correto:</strong>
+<pre>int idade;
+scanf("%d", &amp;idade);</pre>
+</div>
+
+<h3>9.3 Usar %d para float</h3>
+
+<div class="exemplo">
+<strong>Errado:</strong>
+<pre>float nota = 8.5;
+scanf("%d", ¬a);   // Usa %f, não %d!</pre>
+
+<strong>Correto:</strong>
+<pre>float nota;
+scanf("%f", ¬a);</pre>
+</div>
+
+<h3>9.4 Esquecer #include</h3>
+
+<div class="exemplo">
+<strong>Errado:</strong>
+<pre>// Sem #include
+int main() {
+    printf("Olá");  // ERRO: printf não declarado
+}</pre>
+
+<strong>Correto:</strong>
+<pre>#include &lt;stdio.h&gt;
+
+int main() {
+    printf("Olá");
+    return 0;
+}</pre>
+</div>
+
+<h3>9.5 Divisão inteira inesperada</h3>
+
+<div class="exemplo">
+<strong>Problema:</strong>
+<pre>int a = 10, b = 3;
+float resultado = a / b;  // resultado = 3.0 (não 3.33)</pre>
+
+<strong>Solução:</strong>
+<pre>int a = 10, b = 3;
+float resultado = (float)a / b;  // resultado = 3.33</pre>
+</div>
+
+<h2>10. Comparação: C vs JavaScript</h2>
+
+<table>
+    <tbody><tr>
+        <th>Aspecto</th>
+        <th>JavaScript</th>
+        <th>C</th>
+    </tr>
+    <tr>
+        <td>Tipagem</td>
+        <td>Dinâmica</td>
+        <td>Estática</td>
+    </tr>
+    <tr>
+        <td>Declaração</td>
+        <td>let x = 10;</td>
+        <td>int x = 10;</td>
+    </tr>
+    <tr>
+        <td>Entrada</td>
+        <td>input.value</td>
+        <td>scanf()</td>
+    </tr>
+    <tr>
+        <td>Saída</td>
+        <td>.textContent</td>
+        <td>printf()</td>
+    </tr>
+    <tr>
+        <td>Conversão</td>
+        <td>Number()</td>
+        <td>Não precisa*</td>
+    </tr>
+    <tr>
+        <td>String</td>
+        <td>Tipo primitivo</td>
+        <td>Array de char</td>
+    </tr>
+    <tr>
+        <td>Compilação</td>
+        <td>Interpretada</td>
+        <td>Compilada</td>
+    </tr>
+</tbody></table>
+
+<p>* scanf</p></body></html>
