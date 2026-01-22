@@ -1,0 +1,6 @@
+# Binários C
+*.exe
+
+# Pasta de saída (se existir)
+output/
+bin/
