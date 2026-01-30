@@ -11,7 +11,7 @@ var horaBrasil = Number(inHoraBrasil.value);
 if (inHoraBrasil.value ==  "" || isNaN (horaBrasil)) {
     alert("Informe a Hora no Brasil corretamete"); // exibe Alerta
     inHoraBrasil.focus();   // Posiciona o cursor em inHoraBrasil
-
+        return;
     }
 
     let horaFranca = horaBrasil + 5;    // Calcula o Horário na França
