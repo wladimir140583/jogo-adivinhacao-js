@@ -10,8 +10,7 @@ constructor(valor){
 calcularTempo(){
 
     if(this.valor < 1){
-    console.log("Valor insuficiente")
-    return
+    return "Valor insuficiente"
     }
 
     if(this.valor >= 1 && this.valor < 1.75){
@@ -63,6 +62,13 @@ botaoCalcular.addEventListener("click", function(){
 const valor = Number(inputValor.value) // Pega oque o usuário digitou no input -> Number - Transforma texto em numero
 
 const parquimetro = new Parquimetro(valor) // Objeto Criado
+
+const erro = parquimetro.calcularTempo()
+
+if(erro){
+    resultado.innerText = erro
+    return
+}
 
 parquimetro.calcularTempo()
 
